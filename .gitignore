@@ -1,0 +1,8 @@
+__pycache__/
+*.pyc
+.index_cache/
+.model_cache/
+ppt_unpacked/
+.env
+venv/
+*.egg-info/
