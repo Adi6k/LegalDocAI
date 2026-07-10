@@ -156,6 +156,70 @@ def compliance_check(client, model, full_text: str) -> list[dict]:
         return [{"clause": "Parse Error", "status": "RISK", "detail": raw[:200]}]
 
 
+FAIRNESS_QUERY = ("termination liability indemnification penalty obligations "
+                  "sole discretion exclusive rights waiver unilateral")
+
+
+def fairness_analysis(client, model, full_text: str, context_chunks: list[dict]) -> dict:
+    """Judge how one-sided the contract is. Returns
+    {"score": 0-100 (100 = perfectly balanced), "favors": str, "reasons": [str]}."""
+    excerpts = "\n---\n".join(c["chunk"] for c in context_chunks)
+    response = client.chat.completions.create(
+        model=model,
+        messages=[
+            {"role": "system", "content": (
+                "You assess how balanced a contract is between its parties. Reply with ONE "
+                "JSON object only, no other text:\n"
+                '{"score": <0-100 integer, 100 = perfectly balanced, 0 = totally one-sided>, '
+                '"favors": "<party name or role the contract favors, or \'Balanced\'>", '
+                '"reasons": ["<short reason>", "<short reason>", "<short reason>"]}\n'
+                "Base the score on: who carries liability, who can terminate, penalty asymmetry, "
+                "discretionary rights, and waiver clauses.")},
+            {"role": "user", "content":
+                f"CONTRACT (start):\n{_doc_excerpt(full_text, 4000, 1000)}\n\n"
+                f"KEY RISK-RELATED EXCERPTS:\n{excerpts}"},
+        ],
+        temperature=0.1, max_tokens=250, **_extra(client))
+    raw = response.choices[0].message.content.strip()
+    raw = raw.removeprefix("```json").removeprefix("```").removesuffix("```").strip()
+    start, end = raw.find("{"), raw.rfind("}")
+    if start != -1 and end != -1:
+        raw = raw[start:end + 1]
+    try:
+        obj = json.loads(raw)
+        score = max(0, min(100, int(obj.get("score", 50))))
+        reasons = [str(r)[:200] for r in obj.get("reasons", [])][:4]
+        return {"score": score, "favors": str(obj.get("favors", "Unclear"))[:80],
+                "reasons": reasons}
+    except (json.JSONDecodeError, ValueError, TypeError):
+        # Small models sometimes break the JSON — retry once on the larger local model
+        if _is_ollama(client) and model != "llama3.2":
+            return fairness_analysis(client, "llama3.2", full_text, context_chunks)
+        return {"score": -1, "favors": "Could not assess",
+                "reasons": ["The model response could not be parsed — try again "
+                            "or switch to the larger model (llama3.2)."]}
+
+
+def stream_negotiation(client, model, history: list[dict], user_msg: str,
+                       context_chunks: list[dict]):
+    """AI plays opposing counsel for the other party, grounded in the contract.
+    history = prior [{'role': 'user'|'assistant', 'content': ...}] turns."""
+    excerpts = "\n---\n".join(c["chunk"] for c in context_chunks)
+    messages = [
+        {"role": "system", "content": (
+            "You are the OPPOSING COUNSEL in a live contract negotiation. You represent "
+            "the party that this contract favors; the user represents the other side. "
+            "Respond to each of the user's demands in character: defend the existing terms, "
+            "push back with counter-arguments, cite specific clauses from the excerpts when "
+            "you can, and concede ground only when the user makes a genuinely strong argument. "
+            "Never break character or mention being an AI. Keep replies under 150 words.")},
+        *history[-8:],
+        {"role": "user", "content":
+            f"[Relevant contract excerpts:\n{excerpts}]\n\n{user_msg}"},
+    ]
+    return _stream(client, model, messages, temperature=0.6, max_tokens=400)
+
+
 def risk_score(results: list[dict]) -> int:
     if not results:
         return 0

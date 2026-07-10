@@ -1,0 +1,170 @@
+{
+ "total_contracts": 510,
+ "source": "CUAD v1 (Hendrycks et al., NeurIPS 2021)",
+ "categories": {
+  "Affiliate License-Licensee": {
+   "count": 59,
+   "pct": 11.6
+  },
+  "Affiliate License-Licensor": {
+   "count": 23,
+   "pct": 4.5
+  },
+  "Agreement Date": {
+   "count": 470,
+   "pct": 92.2
+  },
+  "Anti-Assignment": {
+   "count": 374,
+   "pct": 73.3
+  },
+  "Audit Rights": {
+   "count": 214,
+   "pct": 42.0
+  },
+  "Cap On Liability": {
+   "count": 275,
+   "pct": 53.9
+  },
+  "Change Of Control": {
+   "count": 121,
+   "pct": 23.7
+  },
+  "Competitive Restriction Exception": {
+   "count": 76,
+   "pct": 14.9
+  },
+  "Covenant Not To Sue": {
+   "count": 100,
+   "pct": 19.6
+  },
+  "Document Name": {
+   "count": 510,
+   "pct": 100.0
+  },
+  "Effective Date": {
+   "count": 390,
+   "pct": 76.5
+  },
+  "Exclusivity": {
+   "count": 180,
+   "pct": 35.3
+  },
+  "Expiration Date": {
+   "count": 413,
+   "pct": 81.0
+  },
+  "Governing Law": {
+   "count": 437,
+   "pct": 85.7
+  },
+  "Insurance": {
+   "count": 166,
+   "pct": 32.5
+  },
+  "Ip Ownership Assignment": {
+   "count": 124,
+   "pct": 24.3
+  },
+  "Irrevocable Or Perpetual License": {
+   "count": 70,
+   "pct": 13.7
+  },
+  "Joint Ip Ownership": {
+   "count": 46,
+   "pct": 9.0
+  },
+  "License Grant": {
+   "count": 255,
+   "pct": 50.0
+  },
+  "Liquidated Damages": {
+   "count": 61,
+   "pct": 12.0
+  },
+  "Minimum Commitment": {
+   "count": 165,
+   "pct": 32.4
+  },
+  "Most Favored Nation": {
+   "count": 28,
+   "pct": 5.5
+  },
+  "No-Solicit Of Customers": {
+   "count": 34,
+   "pct": 6.7
+  },
+  "No-Solicit Of Employees": {
+   "count": 59,
+   "pct": 11.6
+  },
+  "Non-Compete": {
+   "count": 119,
+   "pct": 23.3
+  },
+  "Non-Disparagement": {
+   "count": 38,
+   "pct": 7.5
+  },
+  "Non-Transferable License": {
+   "count": 138,
+   "pct": 27.1
+  },
+  "Notice Period To Terminate Renewal": {
+   "count": 111,
+   "pct": 21.8
+  },
+  "Parties": {
+   "count": 509,
+   "pct": 99.8
+  },
+  "Post-Termination Services": {
+   "count": 182,
+   "pct": 35.7
+  },
+  "Price Restrictions": {
+   "count": 15,
+   "pct": 2.9
+  },
+  "Renewal Term": {
+   "count": 176,
+   "pct": 34.5
+  },
+  "Revenue/Profit Sharing": {
+   "count": 166,
+   "pct": 32.5
+  },
+  "Rofr/Rofo/Rofn": {
+   "count": 85,
+   "pct": 16.7
+  },
+  "Source Code Escrow": {
+   "count": 13,
+   "pct": 2.5
+  },
+  "Termination For Convenience": {
+   "count": 183,
+   "pct": 35.9
+  },
+  "Third Party Beneficiary": {
+   "count": 32,
+   "pct": 6.3
+  },
+  "Uncapped Liability": {
+   "count": 111,
+   "pct": 21.8
+  },
+  "Unlimited/All-You-Can-Eat-License": {
+   "count": 17,
+   "pct": 3.3
+  },
+  "Volume Restriction": {
+   "count": 82,
+   "pct": 16.1
+  },
+  "Warranty Duration": {
+   "count": 75,
+   "pct": 14.7
+  }
+ }
+}

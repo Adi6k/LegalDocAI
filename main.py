@@ -15,7 +15,9 @@ from PIL import Image, ImageTk
 from rag_engine import HybridRAGEngine, extract_document, extract_key_facts
 from llm_backend import (get_llm_client, stream_answer, stream_summary,
                          audit_clause, risk_score, warm_up,
+                         fairness_analysis, stream_negotiation, FAIRNESS_QUERY,
                          COMPLIANCE_CLAUSES, AUDIT_QUERIES)
+from cuad_benchmark import benchmark_for
 
 ctk.set_appearance_mode("dark")
 ctk.set_default_color_theme("dark-blue")
@@ -52,14 +54,38 @@ class LegalDocApp(ctk.CTk):
         self.ask_busy = False
         self.summary_busy = False
         self.audit_busy = False
+        self.fair_busy = False
+        self.nego_busy = False
         self.doc_name = ""
         self.doc_meta = {}
         self.key_facts = {}
         self.last_summary = ""
         self.last_audit = []
+        self.last_fairness = None
         self.chat_log = []  # (question, answer)
+        self.nego_history = []  # [{'role': ..., 'content': ...}] for negotiation practice
         self._page_photos = []  # keep refs so tkinter doesn't GC page images
         self._preview_gen = 0   # invalidates an in-flight render when a new doc opens
+
+        # Lazy PDF-preview state (pages render only when scrolled into view)
+        self._pdf_bytes = None
+        self._pdf_layout = []       # [{'y', 'h'}] per page, computed without rendering
+        self._pdf_rendered = {}     # page index -> PhotoImage (cache)
+        self._pdf_requested = set() # page indices currently being rendered
+        self._render_after = None   # debounce handle for scroll-driven renders
+
+        # Cache font objects once — constructing CTkFont per-widget (especially in
+        # the audit/key-fact/chip loops) is pure allocation churn.
+        self._f = {
+            "h1": ctk.CTkFont(size=19, weight="bold"),
+            "chip": ctk.CTkFont(size=11),
+            "label": ctk.CTkFont(size=11, weight="bold"),
+            "body": ctk.CTkFont(size=14),
+            "body_b": ctk.CTkFont(size=14, weight="bold"),
+            "small": ctk.CTkFont(size=12),
+            "tiny": ctk.CTkFont(size=11),
+            "pill": ctk.CTkFont(size=12, weight="bold"),
+        }
 
         self.grid_columnconfigure(1, weight=1)
         self.grid_rowconfigure(0, weight=1)
@@ -158,11 +184,26 @@ class LegalDocApp(ctk.CTk):
     MAX_PREVIEW_PAGES = 30
     PAGE_WIDTH = 720
 
+    PAGE_GAP = 44
+    RENDER_BUFFER = 600  # px above/below the viewport to pre-render
+
     def _on_preview_scroll(self, event):
         self.preview_canvas.yview_scroll(int(-event.delta / 120) * 3, "units")
+        self._schedule_render()
+
+    def _on_scrollbar(self, *args):
+        self.preview_canvas.yview(*args)
+        self._schedule_render()
+
+    def _schedule_render(self):
+        """Debounce scroll events so we render at most ~every 60ms, not per pixel."""
+        if self._render_after is not None:
+            self.after_cancel(self._render_after)
+        self._render_after = self.after(60, self._render_visible)
 
     def _show_text_preview(self, text):
         self._preview_gen += 1
+        self._pdf_layout = []  # stop any pending lazy renders from a prior PDF
         self.preview_canvas.grid_forget()
         self.preview_scroll.grid_forget()
         self.preview_box.grid(row=0, column=0, columnspan=2, sticky="nsew", padx=4, pady=4)
@@ -172,59 +213,106 @@ class LegalDocApp(ctk.CTk):
         self.preview_box.configure(state="disabled")
 
     def _show_pdf_preview(self, pdf_bytes):
+        """Lay the pages out immediately (cheap — no rasterizing), then rasterize
+        only the pages that are actually scrolled into view."""
         self._preview_gen += 1
         gen = self._preview_gen
         self.preview_box.grid_forget()
         self.preview_canvas.delete("all")
         self._page_photos.clear()
+        self._pdf_rendered.clear()
+        self._pdf_requested.clear()
+        self._pdf_bytes = pdf_bytes
         self.preview_canvas.grid(row=0, column=0, sticky="nsew", padx=(4, 0), pady=4)
         self.preview_scroll.grid(row=0, column=1, sticky="ns", pady=4)
         self.preview_canvas.yview_moveto(0)
-        threading.Thread(target=self._render_pdf_worker, args=(pdf_bytes, gen),
-                         daemon=True).start()
+        # Measuring page sizes only needs page.rect (no pixmap) — do it off-thread
+        # anyway so a huge PDF never stalls the open.
+        threading.Thread(target=self._layout_pdf, args=(pdf_bytes, gen), daemon=True).start()
 
-    def _render_pdf_worker(self, pdf_bytes, gen):
+    def _layout_pdf(self, pdf_bytes, gen):
         try:
             doc = fitz.open(stream=pdf_bytes, filetype="pdf")
-            n = min(doc.page_count, self.MAX_PREVIEW_PAGES)
-            xc = self.PAGE_WIDTH // 2 + 20
+            total = doc.page_count
+            n = min(total, self.MAX_PREVIEW_PAGES)
+            layout = []
             y = 16
             for i in range(n):
-                if gen != self._preview_gen:
-                    return  # a newer document replaced this preview
                 page = doc.load_page(i)
                 scale = self.PAGE_WIDTH / page.rect.width
-                pix = page.get_pixmap(matrix=fitz.Matrix(scale, scale))
-                img = Image.frombytes("RGB", (pix.width, pix.height), pix.samples)
-                h = pix.height
+                h = int(page.rect.height * scale)
+                layout.append({"y": y, "h": h})
+                y += h + self.PAGE_GAP
+            doc.close()
+            bottom = y + (40 if total > n else 0)
 
-                def add(img=img, y=y, i=i, h=h):
-                    if gen != self._preview_gen:
-                        return
-                    photo = ImageTk.PhotoImage(img)
-                    self._page_photos.append(photo)
-                    self.preview_canvas.create_image(xc, y, image=photo, anchor="n")
+            def build():
+                if gen != self._preview_gen:
+                    return
+                self._pdf_layout = layout
+                xc = self.PAGE_WIDTH // 2 + 20
+                for i, pg in enumerate(layout):
+                    # Lightweight placeholder — a page-shaped rect + caption, no bitmap
+                    self.preview_canvas.create_rectangle(
+                        xc - self.PAGE_WIDTH // 2, pg["y"],
+                        xc + self.PAGE_WIDTH // 2, pg["y"] + pg["h"],
+                        fill="#3a3a3a", outline="#4a4a4a", tags=(f"ph{i}",))
                     self.preview_canvas.create_text(
-                        xc, y + h + 12, text=f"Page {i + 1} of {doc.page_count}",
+                        xc, pg["y"] + pg["h"] + 12, text=f"Page {i + 1} of {total}",
                         fill="#8a8a8a", font=("Segoe UI", 9))
-                    self.preview_canvas.configure(
-                        scrollregion=(0, 0, self.PAGE_WIDTH + 40, y + h + 44))
-                self.after(0, add)
-                y += h + 44
-            if doc.page_count > n:
-                def note(y=y):
-                    if gen != self._preview_gen:
-                        return
+                if total > n:
                     self.preview_canvas.create_text(
-                        xc, y + 8,
+                        xc, bottom - 20,
                         text=f"Preview shows the first {n} pages — "
-                             f"all {doc.page_count} pages are indexed and searchable",
+                             f"all {total} pages are indexed and searchable",
                         fill="#9a9a9a", font=("Segoe UI", 10))
-                    self.preview_canvas.configure(
-                        scrollregion=(0, 0, self.PAGE_WIDTH + 40, y + 44))
-                self.after(0, note)
+                self.preview_canvas.configure(scrollregion=(0, 0, self.PAGE_WIDTH + 40, bottom))
+                self._render_visible()
+            self.after(0, build)
         except Exception:
             pass  # preview is cosmetic; never crash the app over it
+
+    def _render_visible(self):
+        """Rasterize just the pages intersecting the viewport (plus a buffer)."""
+        self._render_after = None
+        if not self._pdf_layout:
+            return
+        try:
+            top = self.preview_canvas.canvasy(0) - self.RENDER_BUFFER
+            bot = self.preview_canvas.canvasy(self.preview_canvas.winfo_height()) + self.RENDER_BUFFER
+        except Exception:
+            return
+        for i, pg in enumerate(self._pdf_layout):
+            if pg["y"] + pg["h"] < top or pg["y"] > bot:
+                continue
+            if i in self._pdf_rendered or i in self._pdf_requested:
+                continue
+            self._pdf_requested.add(i)
+            threading.Thread(target=self._render_page,
+                             args=(i, self._preview_gen), daemon=True).start()
+
+    def _render_page(self, idx, gen):
+        try:
+            doc = fitz.open(stream=self._pdf_bytes, filetype="pdf")
+            page = doc.load_page(idx)
+            scale = self.PAGE_WIDTH / page.rect.width
+            pix = page.get_pixmap(matrix=fitz.Matrix(scale, scale))
+            img = Image.frombytes("RGB", (pix.width, pix.height), pix.samples)
+            doc.close()
+
+            def place():
+                self._pdf_requested.discard(idx)
+                if gen != self._preview_gen or idx >= len(self._pdf_layout):
+                    return
+                photo = ImageTk.PhotoImage(img)
+                self._pdf_rendered[idx] = photo  # cache keeps the ref alive
+                pg = self._pdf_layout[idx]
+                xc = self.PAGE_WIDTH // 2 + 20
+                self.preview_canvas.delete(f"ph{idx}")  # drop the placeholder
+                self.preview_canvas.create_image(xc, pg["y"], image=photo, anchor="n")
+            self.after(0, place)
+        except Exception:
+            self._pdf_requested.discard(idx)
 
     def _set_progress(self, frac, msg=None):
         self.progress.set(frac)
@@ -240,15 +328,14 @@ class LegalDocApp(ctk.CTk):
 
         header = ctk.CTkFrame(main, fg_color="transparent")
         header.grid(row=0, column=0, sticky="ew", padx=10, pady=(6, 2))
-        self.header = ctk.CTkLabel(header, text="",
-                                   font=ctk.CTkFont(size=19, weight="bold"), anchor="w")
+        self.header = ctk.CTkLabel(header, text="", font=self._f["h1"], anchor="w")
         self.header.pack(side="left")
         self.chips = ctk.CTkFrame(header, fg_color="transparent")
         self.chips.pack(side="left", padx=12)
 
         # Tabs are hidden until a document is loaded; the landing view shows first
         self.tabs = ctk.CTkTabview(main)
-        for name in ("Preview", "Ask", "Summary", "Audit"):
+        for name in ("Preview", "Ask", "Summary", "Audit", "Negotiate"):
             self.tabs.add(name)
         self._build_landing(main)
 
@@ -272,12 +359,13 @@ class LegalDocApp(ctk.CTk):
         self.preview_canvas = tk.Canvas(self.preview_area, bg="#2b2b2b",
                                         highlightthickness=0, bd=0)
         self.preview_scroll = ctk.CTkScrollbar(self.preview_area,
-                                               command=self.preview_canvas.yview)
+                                               command=self._on_scrollbar)
         self.preview_canvas.configure(yscrollcommand=self.preview_scroll.set)
         self.preview_canvas.bind("<Enter>", lambda e: self.preview_canvas.bind_all(
             "<MouseWheel>", self._on_preview_scroll))
         self.preview_canvas.bind("<Leave>", lambda e: self.preview_canvas.unbind_all(
             "<MouseWheel>"))
+        self.preview_canvas.bind("<Configure>", lambda e: self._schedule_render())
 
         self.facts_frame = ctk.CTkScrollableFrame(pv, label_text="Key facts detected")
         self.facts_frame.grid(row=0, column=1, sticky="nsew", padx=(3, 6), pady=6)
@@ -335,19 +423,52 @@ class LegalDocApp(ctk.CTk):
         # Audit tab
         au = self.tabs.tab("Audit")
         au.grid_columnconfigure(0, weight=1)
-        au.grid_rowconfigure(2, weight=1)
+        au.grid_rowconfigure(3, weight=1)
         top = ctk.CTkFrame(au, fg_color="transparent")
         top.grid(row=0, column=0, sticky="ew", padx=6, pady=6)
         self.audit_btn = ctk.CTkButton(top, text="Run Compliance Audit", height=38,
                                        font=ctk.CTkFont(size=14),
                                        command=self.run_audit)
         self.audit_btn.pack(side="left")
+        self.fair_btn = ctk.CTkButton(top, text="Fairness Analysis", height=38,
+                                      font=ctk.CTkFont(size=14),
+                                      fg_color="#5b4a8a", hover_color="#463a6b",
+                                      command=self.run_fairness)
+        self.fair_btn.pack(side="left", padx=(8, 0))
         self.score_label = ctk.CTkLabel(top, text="", font=ctk.CTkFont(size=26, weight="bold"))
         self.score_label.pack(side="right", padx=12)
+        self.fair_panel = ctk.CTkFrame(au)  # gridded at row=1 once analysis runs
         self.audit_counts = ctk.CTkLabel(au, text="", font=ctk.CTkFont(size=14, weight="bold"))
-        self.audit_counts.grid(row=1, column=0, padx=10, pady=(0, 4), sticky="w")
+        self.audit_counts.grid(row=2, column=0, padx=10, pady=(0, 4), sticky="w")
         self.audit_frame = ctk.CTkScrollableFrame(au, fg_color="transparent")
-        self.audit_frame.grid(row=2, column=0, sticky="nsew", padx=6, pady=(0, 6))
+        self.audit_frame.grid(row=3, column=0, sticky="nsew", padx=6, pady=(0, 6))
+
+        # Negotiate tab — AI plays opposing counsel
+        ng = self.tabs.tab("Negotiate")
+        ng.grid_columnconfigure(0, weight=1)
+        ng.grid_rowconfigure(1, weight=1)
+        ctk.CTkLabel(ng, text="⚔  Negotiation practice — the AI is the other side's lawyer. "
+                              "It defends this contract and pushes back on your arguments. "
+                              "Convince it.",
+                     text_color="gray60", anchor="w", justify="left",
+                     font=ctk.CTkFont(size=13)).grid(row=0, column=0, columnspan=2,
+                                                     sticky="ew", padx=10, pady=(8, 2))
+        self.nego_box = ctk.CTkTextbox(ng, wrap="word", font=ctk.CTkFont(size=14))
+        self.nego_box.grid(row=1, column=0, columnspan=2, sticky="nsew", padx=6, pady=6)
+        self.nego_box.tag_config("you", foreground=ACCENT)
+        self.nego_box.tag_config("counsel", foreground="#e0a458")
+        self.nego_box.tag_config("dim", foreground="#8a8a8a")
+        self.nego_box.configure(state="disabled")
+        self.nego_entry = ctk.CTkEntry(ng, placeholder_text=
+                                       "Make your argument…  e.g.  The liability cap is one-sided — it must be mutual.",
+                                       height=40, font=ctk.CTkFont(size=14))
+        self.nego_entry.grid(row=2, column=0, sticky="ew", padx=(6, 4), pady=(0, 6))
+        self.nego_entry.bind("<Return>", lambda e: self.send_nego())
+        self.nego_send = ctk.CTkButton(ng, text="Argue", width=96, height=40,
+                                       font=ctk.CTkFont(size=14),
+                                       fg_color="#8a4a4a", hover_color="#6b3a3a",
+                                       command=self.send_nego)
+        self.nego_send.grid(row=2, column=1, padx=(0, 6), pady=(0, 6))
 
     # ── Landing view ──────────────────────────────────────────────────────
     def _build_landing(self, parent):
@@ -369,7 +490,8 @@ class LegalDocApp(ctk.CTk):
             ("📄", "Preview", "The real pages, plus dates,\namounts and deadlines"),
             ("💬", "Ask", "Chat with the document —\nanswers stream with sources"),
             ("📝", "Summary", "Parties, obligations, dates\nand risks in one click"),
-            ("🔍", "Audit", "10 standard clauses checked,\nscored 0–100"),
+            ("🔍", "Audit", "10 clauses checked, benchmarked\nagainst 510 real contracts"),
+            ("⚔️", "Negotiate", "Spar with an AI opposing\ncounsel before you sign"),
             ("📤", "Report", "Client-ready Word report\nof everything found"),
         ]
         for i, (ic, t, d) in enumerate(feats):
@@ -441,13 +563,15 @@ class LegalDocApp(ctk.CTk):
         if "connect" in msg.lower():
             msg += "\n\nOllama doesn't appear to be running. Start the Ollama app and try again."
         self.ingesting = self.ask_busy = self.summary_busy = self.audit_busy = False
+        self.fair_busy = self.nego_busy = False
         self.progress.set(0)
         self._set_status("Error — see popup.")
         messagebox.showerror("LegalDoc AI", msg)
 
     # ── Document loading ──────────────────────────────────────────────────
     def open_document(self):
-        if self.ingesting or self.ask_busy or self.summary_busy or self.audit_busy:
+        if (self.ingesting or self.ask_busy or self.summary_busy or self.audit_busy
+                or self.fair_busy or self.nego_busy):
             return
         path = filedialog.askopenfilename(
             title="Open legal document",
@@ -488,7 +612,9 @@ class LegalDocApp(ctk.CTk):
                 self.key_facts = facts
                 self.last_summary = ""
                 self.last_audit = []
+                self.last_fairness = None
                 self.chat_log = []
+                self.nego_history = []
                 self.open_btn.configure(state="normal")
                 self.export_btn.configure(state="normal")
                 self._show_workspace()
@@ -503,7 +629,7 @@ class LegalDocApp(ctk.CTk):
                 for t in chip_items:
                     ctk.CTkLabel(self.chips, text=f"  {t}  ", corner_radius=9, height=24,
                                  fg_color="#26282c", text_color="#9fa6ad",
-                                 font=ctk.CTkFont(size=11)).pack(side="left", padx=4)
+                                 font=self._f["tiny"]).pack(side="left", padx=4)
                 self.doc_label.configure(text=f"✅ {name}", text_color="#2ecc71")
                 self._set_status("Document ready. Try the Ask, Summary or Audit tabs.")
                 self._warm_model_async()  # preload the model so actions feel instant
@@ -520,18 +646,21 @@ class LegalDocApp(ctk.CTk):
                     if not items:
                         continue
                     ctk.CTkLabel(self.facts_frame, text=cat.upper(),
-                                 font=ctk.CTkFont(size=11, weight="bold"),
+                                 font=self._f["label"],
                                  text_color="gray50").pack(anchor="w", padx=6, pady=(8, 0))
                     for it in items:
                         ctk.CTkLabel(self.facts_frame, text=f"• {it}", anchor="w",
                                      wraplength=210, justify="left").pack(anchor="w", padx=10)
                 # Clear old outputs
-                for box in (self.chat_box, self.summary_box):
+                for box in (self.chat_box, self.summary_box, self.nego_box):
                     box.configure(state="normal")
                     box.delete("1.0", "end")
                     box.configure(state="disabled")
                 for w in self.audit_frame.winfo_children():
                     w.destroy()
+                for w in self.fair_panel.winfo_children():
+                    w.destroy()
+                self.fair_panel.grid_forget()
                 self.score_label.configure(text="")
                 self.audit_counts.configure(text="")
                 self.tabs.set("Preview")
@@ -573,12 +702,19 @@ class LegalDocApp(ctk.CTk):
             self.after(0, lambda e=e: self._fail(e))
 
     def _append(self, box, text, tag=None):
+        # Only auto-scroll if the user is already near the bottom, so a reader who
+        # scrolled up to re-read isn't yanked down on every streamed token.
+        try:
+            at_bottom = box.yview()[1] > 0.92
+        except Exception:
+            at_bottom = True
         box.configure(state="normal")
         if tag:
             box.insert("end", text, tag)
         else:
             box.insert("end", text)
-        box.see("end")
+        if at_bottom:
+            box.see("end")
         box.configure(state="disabled")
 
     # ── Ask ───────────────────────────────────────────────────────────────
@@ -681,13 +817,18 @@ class LegalDocApp(ctk.CTk):
             row.pack(fill="x", pady=4, padx=4)
             ctk.CTkLabel(row, text=status, width=94, height=26, corner_radius=13,
                          fg_color=c, text_color="#101010",
-                         font=ctk.CTkFont(size=12, weight="bold")).pack(side="left", padx=10, pady=10)
+                         font=self._f["pill"]).pack(side="left", padx=10, pady=10)
             body = ctk.CTkFrame(row, fg_color="transparent")
             body.pack(side="left", fill="x", expand=True, padx=(0, 8), pady=6)
             ctk.CTkLabel(body, text=r.get("clause", "?"), anchor="w",
-                         font=ctk.CTkFont(size=14, weight="bold")).pack(fill="x")
+                         font=self._f["body_b"]).pack(fill="x")
             ctk.CTkLabel(body, text=r.get("detail", ""), anchor="w", justify="left",
                          wraplength=780, text_color="gray70").pack(fill="x")
+            bm = benchmark_for(r.get("clause", ""), r.get("status", ""))
+            if bm:
+                ctk.CTkLabel(body, text=bm, anchor="w", justify="left", wraplength=780,
+                             text_color="#7f9cc4",
+                             font=self._f["tiny"]).pack(fill="x", pady=(1, 0))
 
         def worker():
             try:
@@ -734,6 +875,94 @@ class LegalDocApp(ctk.CTk):
                            self._fail(e)))
         threading.Thread(target=worker, daemon=True).start()
 
+    # ── Fairness analysis ─────────────────────────────────────────────────
+    def run_fairness(self):
+        if not self._require_doc(self.fair_busy):
+            return
+        self.fair_busy = True
+        self.fair_btn.configure(state="disabled", text="Analyzing…")
+        self._set_status("Weighing how balanced this contract is...")
+        self._pulse_start()
+
+        def worker():
+            try:
+                client, model = self._client_and_model()
+                chunks = self.engine.hybrid_retrieve(FAIRNESS_QUERY, top_k=6, bm25_weight=0.4)
+                res = fairness_analysis(client, model, self.engine.get_all_text(), chunks)
+
+                def done():
+                    self.fair_busy = False
+                    self._pulse_stop()
+                    self.fair_btn.configure(state="normal", text="Fairness Analysis")
+                    self.last_fairness = res
+                    self._show_fairness(res)
+                    self._set_status("Fairness analysis complete.")
+                self.after(0, done)
+            except Exception as e:
+                self.after(0, lambda e=e: (self._pulse_stop(),
+                           self.fair_btn.configure(state="normal", text="Fairness Analysis"),
+                           self._fail(e)))
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _show_fairness(self, res):
+        for w in self.fair_panel.winfo_children():
+            w.destroy()
+        self.fair_panel.grid(row=1, column=0, sticky="ew", padx=6, pady=(0, 6))
+        score = res.get("score", -1)
+        if score < 0:
+            ctk.CTkLabel(self.fair_panel, text=f"⚠  {res['reasons'][0]}",
+                         text_color="#f39c12", anchor="w").pack(padx=12, pady=10, anchor="w")
+            return
+        color = "#2ecc71" if score >= 70 else "#f39c12" if score >= 40 else "#e74c3c"
+        verdict = ("Balanced" if score >= 70 else
+                   "Somewhat one-sided" if score >= 40 else "Heavily one-sided")
+        left = ctk.CTkFrame(self.fair_panel, fg_color="transparent")
+        left.pack(side="left", padx=(12, 16), pady=10)
+        ctk.CTkLabel(left, text=f"Balance: {score}/100",
+                     font=ctk.CTkFont(size=20, weight="bold"),
+                     text_color=color).pack(anchor="w")
+        bar = ctk.CTkProgressBar(left, width=190, height=8, progress_color=color)
+        bar.set(score / 100)
+        bar.pack(anchor="w", pady=(4, 2))
+        ctk.CTkLabel(left, text=f"{verdict} — favors {res['favors']}",
+                     text_color="gray65", font=ctk.CTkFont(size=12)).pack(anchor="w")
+        reasons = "\n".join(f"•  {r}" for r in res.get("reasons", []))
+        ctk.CTkLabel(self.fair_panel, text=reasons, anchor="w", justify="left",
+                     wraplength=560, text_color="gray70",
+                     font=ctk.CTkFont(size=12)).pack(side="left", padx=(0, 12), pady=10)
+
+    # ── Negotiation practice ──────────────────────────────────────────────
+    def send_nego(self):
+        if not self._require_doc(self.nego_busy):
+            return
+        msg = self.nego_entry.get().strip()
+        if not msg:
+            return
+        self.nego_entry.delete(0, "end")
+        self.nego_busy = True
+        self.nego_send.configure(state="disabled")
+        self._append(self.nego_box, f"You  ▸  {msg}\n\n", "you")
+        self._append(self.nego_box, "Opposing Counsel  ▸  ", "counsel")
+        self._set_status("Opposing counsel is preparing a response...")
+        threading.Thread(target=self._nego_worker, args=(msg,), daemon=True).start()
+
+    def _nego_worker(self, msg):
+        try:
+            chunks = self.engine.hybrid_retrieve(msg, top_k=4, bm25_weight=0.4)
+            client, model = self._client_and_model()
+            gen = stream_negotiation(client, model, self.nego_history, msg, chunks)
+
+            def finish(full):
+                self.nego_history.append({"role": "user", "content": msg})
+                self.nego_history.append({"role": "assistant", "content": full})
+                self._append(self.nego_box, f"\n\n{'·' * 80}\n\n", "dim")
+                self.nego_busy = False
+                self.nego_send.configure(state="normal")
+                self._set_status("Your move — counter the argument.")
+            self._stream_into(self.nego_box, gen, on_done=finish)
+        except Exception as e:
+            self.after(0, lambda e=e: (self.nego_send.configure(state="normal"), self._fail(e)))
+
     # ── Export ────────────────────────────────────────────────────────────
     def export_report(self):
         if not self.doc_loaded or self.ingesting:
@@ -776,11 +1005,24 @@ class LegalDocApp(ctk.CTk):
                     row[1].text = r.get("status", "")
                     row[2].text = r.get("detail", "")
 
+            if self.last_fairness and self.last_fairness.get("score", -1) >= 0:
+                f = self.last_fairness
+                doc.add_heading("Fairness / Negotiation Leverage", 1)
+                doc.add_paragraph(f"Balance score: {f['score']}/100 — favors {f['favors']}")
+                for r in f.get("reasons", []):
+                    doc.add_paragraph(r, style="List Bullet")
+
             if self.chat_log:
                 doc.add_heading("Q&A Session", 1)
                 for q, a in self.chat_log:
                     doc.add_paragraph(f"Q: {q}", style="Intense Quote")
                     doc.add_paragraph(a)
+
+            if self.nego_history:
+                doc.add_heading("Negotiation Practice Transcript", 1)
+                for turn in self.nego_history:
+                    who = "You" if turn["role"] == "user" else "Opposing Counsel (AI)"
+                    doc.add_paragraph(f"{who}: {turn['content']}")
 
             doc.save(path)
             self._set_status(f"Report saved: {os.path.basename(path)}")

@@ -3,6 +3,10 @@ __pycache__/
 .index_cache/
 .model_cache/
 ppt_unpacked/
+ppt2_unpacked/
+report_unpacked/
+qa_slides/
+~$*
 .env
 venv/
 *.egg-info/
